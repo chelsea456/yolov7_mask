@@ -1,471 +1,478 @@
 # YOLOv5 🚀 by Ultralytics, GPL-3.0 license
 """
-Validate a trained YOLOv5 segment model on a segment dataset
+YOLO-specific modules
 
 Usage:
-    $ bash data/scripts/get_coco.sh --val --segments  # download COCO-segments val split (1G, 5000 images)
-    $ python segment/val.py --weights yolov5s-seg.pt --data coco.yaml --img 640-  # validate COCO-segments
-
-Usage - formats:
-    $ python segment/val.py --weights yolov5s-seg.pt                 # PyTorch
-                                      yolov5s-seg.torchscript        # TorchScript
-                                      yolov5s-seg.onnx               # ONNX Runtime or OpenCV DNN with --dnn
-                                      yolov5s-seg.xml                # OpenVINO
-                                      yolov5s-seg.engine             # TensorRT
-                                      yolov5s-seg.mlmodel            # CoreML (macOS-only)
-                                      yolov5s-seg_saved_model        # TensorFlow SavedModel
-                                      yolov5s-seg.pb                 # TensorFlow GraphDef
-                                      yolov5s-seg.tflite             # TensorFlow Lite
-                                      yolov5s-seg_edgetpu.tflite     # TensorFlow Edge TPU
+    $ python models/yolo.py --cfg yolov5s.yaml
 """
 
 import argparse
-import json
+import contextlib
 import os
+import platform
 import sys
-from multiprocessing.pool import ThreadPool
+from copy import deepcopy
 from pathlib import Path
-
-import numpy as np
-import torch
-from tqdm import tqdm
 
 FILE = Path(__file__).resolve()
 ROOT = FILE.parents[1]  # YOLOv5 root directory
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))  # add ROOT to PATH
-ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
+if platform.system() != 'Windows':
+    ROOT = Path(os.path.relpath(ROOT, Path.cwd()))  # relative
 
-import torch.nn.functional as F
+from models.common import *
+from models.experimental import *
+from utils.autoanchor import check_anchor_order
+from utils.general import LOGGER, check_version, check_yaml, make_divisible, print_args
+from utils.plots import feature_visualization
+from utils.torch_utils import (fuse_conv_and_bn, initialize_weights, model_info, profile, scale_img, select_device,
+                               time_sync)
 
-from models.common import DetectMultiBackend
-from models.yolo import SegmentationModel
-from utils.callbacks import Callbacks
-from utils.general import (LOGGER, NUM_THREADS, Profile, check_dataset, check_img_size, check_requirements, check_yaml,
-                           coco80_to_coco91_class, colorstr, increment_path, non_max_suppression, print_args,
-                           scale_coords, xywh2xyxy, xyxy2xywh)
-from utils.metrics import ConfusionMatrix, box_iou
-from utils.plots import output_to_target, plot_val_study
-from utils.segment.dataloaders import create_dataloader
-from utils.segment.general import mask_iou, process_mask, process_mask_upsample, scale_masks
-from utils.segment.metrics import Metrics, ap_per_class_box_and_mask
-from utils.segment.plots import plot_images_and_masks
-from utils.torch_utils import de_parallel, select_device, smart_inference_mode
+try:
+    import thop  # for FLOPs computation
+except ImportError:
+    thop = None
 
 
-def save_one_txt(predn, save_conf, shape, file):
-    # Save one txt result
-    gn = torch.tensor(shape)[[1, 0, 1, 0]]  # normalization gain whwh
-    for *xyxy, conf, cls in predn.tolist():
-        xywh = (xyxy2xywh(torch.tensor(xyxy).view(1, 4)) / gn).view(-1).tolist()  # normalized xywh
-        line = (cls, *xywh, conf) if save_conf else (cls, *xywh)  # label format
-        with open(file, 'a') as f:
-            f.write(('%g ' * len(line)).rstrip() % line + '\n')
+class Detect(nn.Module):
+    # YOLOv5 Detect head for detection models
+    stride = None  # strides computed during build
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
+
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.empty(1)] * self.nl  # init grid
+        self.anchor_grid = [torch.empty(1)] * self.nl  # init anchor grid
+        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+
+    def forward(self, x):
+        z = []  # inference output
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])  # conv
+            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:  # inference
+                if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
+
+                y = x[i].clone()
+                y[..., :5 + self.nc].sigmoid_()
+                if self.inplace:
+                    y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
+                    xy, wh, etc = y.split((2, 2, self.no - 4), 4)  # tensor_split((2, 4, 5), 4) if torch 1.8.0
+                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, etc), 4)
+                z.append(y.view(bs, -1, self.no))
+
+        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+
+    def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
+        d = self.anchors[i].device
+        t = self.anchors[i].dtype
+        shape = 1, self.na, ny, nx, 2  # grid shape
+        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
+        yv, xv = torch.meshgrid(y, x, indexing='ij') if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
+        grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        return grid, anchor_grid
 
 
-def save_one_json(predn, jdict, path, class_map, pred_masks):
-    # Save one JSON result {"image_id": 42, "category_id": 18, "bbox": [258.15, 41.29, 348.26, 243.78], "score": 0.236}
-    from pycocotools.mask import encode
+class IDetect(nn.Module):
+    # YOLOR Detect head for detection models
+    stride = None  # strides computed during build
+    dynamic = False  # force grid reconstruction
+    export = False  # export mode
 
-    def single_encode(x):
-        rle = encode(np.asarray(x[:, :, None], order="F", dtype="uint8"))[0]
-        rle["counts"] = rle["counts"].decode("utf-8")
-        return rle
+    def __init__(self, nc=80, anchors=(), ch=(), inplace=True):  # detection layer
+        super().__init__()
+        self.nc = nc  # number of classes
+        self.no = nc + 5  # number of outputs per anchor
+        self.nl = len(anchors)  # number of detection layers
+        self.na = len(anchors[0]) // 2  # number of anchors
+        self.grid = [torch.empty(1)] * self.nl  # init grid
+        self.anchor_grid = [torch.empty(1)] * self.nl  # init anchor grid
+        self.register_buffer('anchors', torch.tensor(anchors).float().view(self.nl, -1, 2))  # shape(nl,na,2)
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.inplace = inplace  # use inplace ops (e.g. slice assignment)
+        
+        self.ia = nn.ModuleList(ImplicitA(x) for x in ch)
+        self.im = nn.ModuleList(ImplicitM(self.no * self.na) for _ in ch)
 
-    image_id = int(path.stem) if path.stem.isnumeric() else path.stem
-    box = xyxy2xywh(predn[:, :4])  # xywh
-    box[:, :2] -= box[:, 2:] / 2  # xy center to top-left corner
-    pred_masks = np.transpose(pred_masks, (2, 0, 1))
-    with ThreadPool(NUM_THREADS) as pool:
-        rles = pool.map(single_encode, pred_masks)
-    for i, (p, b) in enumerate(zip(predn.tolist(), box.tolist())):
-        jdict.append({
-            'image_id': image_id,
-            'category_id': class_map[int(p[5])],
-            'bbox': [round(x, 3) for x in b],
-            'score': round(p[4], 5),
-            'segmentation': rles[i]})
+    def forward(self, x):
+        z = []  # inference output
+        for i in range(self.nl):
+            x[i] = self.m[i](self.ia[i](x[i]))  # conv
+            bs, _, ny, nx = x[i].shape  # x(bs,255,20,20) to x(bs,3,20,20,85)
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
 
+            if not self.training:  # inference
+                if self.dynamic or self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i], self.anchor_grid[i] = self._make_grid(nx, ny, i)
 
-def process_batch(detections, labels, iouv, pred_masks=None, gt_masks=None, overlap=False, masks=False):
-    """
-    Return correct prediction matrix
-    Arguments:
-        detections (array[N, 6]), x1, y1, x2, y2, conf, class
-        labels (array[M, 5]), class, x1, y1, x2, y2
-    Returns:
-        correct (array[N, 10]), for 10 IoU levels
-    """
-    if masks:
-        if overlap:
-            nl = len(labels)
-            index = torch.arange(nl, device=gt_masks.device).view(nl, 1, 1) + 1
-            gt_masks = gt_masks.repeat(nl, 1, 1)  # shape(1,640,640) -> (n,640,640)
-            gt_masks = torch.where(gt_masks == index, 1.0, 0.0)
-        if gt_masks.shape[1:] != pred_masks.shape[1:]:
-            gt_masks = F.interpolate(gt_masks[None], pred_masks.shape[1:], mode="bilinear", align_corners=False)[0]
-            gt_masks = gt_masks.gt_(0.5)
-        iou = mask_iou(gt_masks.view(gt_masks.shape[0], -1), pred_masks.view(pred_masks.shape[0], -1))
-    else:  # boxes
-        iou = box_iou(labels[:, 1:], detections[:, :4])
+                y = x[i].clone()
+                y[..., :5 + self.nc].sigmoid_()
+                if self.inplace:
+                    y[..., 0:2] = (y[..., 0:2] * 2 + self.grid[i]) * self.stride[i]  # xy
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]  # wh
+                else:  # for YOLOv5 on AWS Inferentia https://github.com/ultralytics/yolov5/pull/2953
+                    xy, wh, etc = y.split((2, 2, self.no - 4), 4)  # tensor_split((2, 4, 5), 4) if torch 1.8.0
+                    xy = (xy * 2 + self.grid[i]) * self.stride[i]  # xy
+                    wh = (wh * 2) ** 2 * self.anchor_grid[i]  # wh
+                    y = torch.cat((xy, wh, etc), 4)
+                z.append(y.view(bs, -1, self.no))
 
-    correct = np.zeros((detections.shape[0], iouv.shape[0])).astype(bool)
-    correct_class = labels[:, 0:1] == detections[:, 5]
-    for i in range(len(iouv)):
-        x = torch.where((iou >= iouv[i]) & correct_class)  # IoU > threshold and classes match
-        if x[0].shape[0]:
-            matches = torch.cat((torch.stack(x, 1), iou[x[0], x[1]][:, None]), 1).cpu().numpy()  # [label, detect, iou]
-            if x[0].shape[0] > 1:
-                matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 1], return_index=True)[1]]
-                # matches = matches[matches[:, 2].argsort()[::-1]]
-                matches = matches[np.unique(matches[:, 0], return_index=True)[1]]
-            correct[matches[:, 1].astype(int), i] = True
-    return torch.tensor(correct, dtype=torch.bool, device=iouv.device)
+        return x if self.training else (torch.cat(z, 1),) if self.export else (torch.cat(z, 1), x)
+
+    def _make_grid(self, nx=20, ny=20, i=0, torch_1_10=check_version(torch.__version__, '1.10.0')):
+        d = self.anchors[i].device
+        t = self.anchors[i].dtype
+        shape = 1, self.na, ny, nx, 2  # grid shape
+        y, x = torch.arange(ny, device=d, dtype=t), torch.arange(nx, device=d, dtype=t)
+        yv, xv = torch.meshgrid(y, x, indexing='ij') if torch_1_10 else torch.meshgrid(y, x)  # torch>=0.7 compatibility
+        grid = torch.stack((xv, yv), 2).expand(shape) - 0.5  # add grid offset, i.e. y = 2.0 * x - 0.5
+        anchor_grid = (self.anchors[i] * self.stride[i]).view((1, self.na, 1, 1, 2)).expand(shape)
+        return grid, anchor_grid
 
 
-@smart_inference_mode()
-def run(
-        data,
-        weights=None,  # model.pt path(s)
-        batch_size=32,  # batch size
-        imgsz=640,  # inference size (pixels)
-        conf_thres=0.001,  # confidence threshold
-        iou_thres=0.6,  # NMS IoU threshold
-        max_det=300,  # maximum detections per image
-        task='val',  # train, val, test, speed or study
-        device='',  # cuda device, i.e. 0 or 0,1,2,3 or cpu
-        workers=8,  # max dataloader workers (per RANK in DDP mode)
-        single_cls=False,  # treat as single-class dataset
-        augment=False,  # augmented inference
-        verbose=False,  # verbose output
-        save_txt=False,  # save results to *.txt
-        save_hybrid=False,  # save label+prediction hybrid results to *.txt
-        save_conf=False,  # save confidences in --save-txt labels
-        save_json=False,  # save a COCO-JSON results file
-        project=ROOT / 'runs/val-seg',  # save to project/name
-        name='exp',  # save to project/name
-        exist_ok=False,  # existing project/name ok, do not increment
-        half=True,  # use FP16 half-precision inference
-        dnn=False,  # use OpenCV DNN for ONNX inference
-        model=None,
-        dataloader=None,
-        save_dir=Path(''),
-        plots=True,
-        overlap=False,
-        mask_downsample_ratio=1,
-        compute_loss=None,
-        callbacks=Callbacks(),
-):
-    if save_json:
-        check_requirements(['pycocotools'])
-        process = process_mask_upsample  # more accurate
-    else:
-        process = process_mask  # faster
+class Segment(Detect):
+    # YOLOv5 Segment head for segmentation models
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, anchors, ch, inplace)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+        self.detect = Detect.forward
 
-    # Initialize/load model and set device
-    training = model is not None
-    if training:  # called by train.py
-        device, pt, jit, engine = next(model.parameters()).device, True, False, False  # get model device, PyTorch model
-        half &= device.type != 'cpu'  # half precision only supported on CUDA
-        model.half() if half else model.float()
-        nm = de_parallel(model).model[-1].nm  # number of masks
-    else:  # called directly
-        device = select_device(device, batch_size=batch_size)
+    def forward(self, x):
+        p = self.proto(x[0])
+        x = self.detect(self, x)
+        return (x, p) if self.training else (x[0], p) if self.export else (x[0], (x[1], p))
 
-        # Directories
-        save_dir = increment_path(Path(project) / name, exist_ok=exist_ok)  # increment run
-        (save_dir / 'labels' if save_txt else save_dir).mkdir(parents=True, exist_ok=True)  # make dir
 
-        # Load model
-        model = DetectMultiBackend(weights, device=device, dnn=dnn, data=data, fp16=half)
-        stride, pt, jit, engine = model.stride, model.pt, model.jit, model.engine
-        imgsz = check_img_size(imgsz, s=stride)  # check image size
-        half = model.fp16  # FP16 supported on limited backends with CUDA
-        nm = de_parallel(model).model.model[-1].nm if isinstance(model, SegmentationModel) else 32  # number of masks
-        if engine:
-            batch_size = model.batch_size
+class ISegment(IDetect):
+    # YOLOR Segment head for segmentation models
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, anchors, ch, inplace)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch)  # output conv
+        self.proto = Proto(ch[0], self.npr, self.nm)  # protos
+        self.detect = IDetect.forward
+
+    def forward(self, x):
+        p = self.proto(x[0])
+        x = self.detect(self, x)
+        return (x, p) if self.training else (x[0], p) if self.export else (x[0], (x[1], p))
+
+
+class IRSegment(IDetect):
+    # YOLOR Segment head for segmentation models
+    def __init__(self, nc=80, anchors=(), nm=32, npr=256, ch=(), inplace=True):
+        super().__init__(nc, anchors, ch, inplace)
+        self.nm = nm  # number of masks
+        self.npr = npr  # number of protos
+        self.no = 5 + nc + self.nm  # number of outputs per anchor
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[self.nl:])  # output conv
+        self.refine = Refine(ch[:self.nl], self.npr, self.nm)  # protos
+        self.detect = IDetect.forward
+
+    def forward(self, x):
+        p = self.refine(x[:self.nl])
+        x = self.detect(self, x[self.nl:])
+        return (x, p) if self.training else (x[0], p) if self.export else (x[0], (x[1], p))
+
+
+class BaseModel(nn.Module):
+    # YOLOv5 base model
+    def forward(self, x, profile=False, visualize=False):
+        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+
+    def _forward_once(self, x, profile=False, visualize=False):
+        y, dt = [], []  # outputs
+        for m in self.model:
+            if m.f != -1:  # if not from previous layer
+                x = y[m.f] if isinstance(m.f, int) else [x if j == -1 else y[j] for j in m.f]  # from earlier layers
+            if profile:
+                self._profile_one_layer(m, x, dt)
+            x = m(x)  # run
+            y.append(x if m.i in self.save else None)  # save output
+            if visualize:
+                feature_visualization(x, m.type, m.i, save_dir=visualize)
+        return x
+
+    def _profile_one_layer(self, m, x, dt):
+        c = m == self.model[-1]  # is final layer, copy input as inplace fix
+        o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPs
+        t = time_sync()
+        for _ in range(10):
+            m(x.copy() if c else x)
+        dt.append((time_sync() - t) * 100)
+        if m == self.model[0]:
+            LOGGER.info(f"{'time (ms)':>10s} {'GFLOPs':>10s} {'params':>10s}  module")
+        LOGGER.info(f'{dt[-1]:10.2f} {o:10.2f} {m.np:10.0f}  {m.type}')
+        if c:
+            LOGGER.info(f"{sum(dt):10.2f} {'-':>10s} {'-':>10s}  Total")
+
+    def fuse(self):  # fuse model Conv2d() + BatchNorm2d() layers
+        LOGGER.info('Fusing layers... ')
+        for m in self.model.modules():
+            if isinstance(m, (Conv, DWConv)) and hasattr(m, 'bn'):
+                m.conv = fuse_conv_and_bn(m.conv, m.bn)  # update conv
+                delattr(m, 'bn')  # remove batchnorm
+                m.forward = m.forward_fuse  # update forward
+        self.info()
+        return self
+
+    def info(self, verbose=False, img_size=640):  # print model information
+        model_info(self, verbose, img_size)
+
+    def _apply(self, fn):
+        # Apply to(), cpu(), cuda(), half() to model tensors that are not parameters or registered buffers
+        self = super()._apply(fn)
+        m = self.model[-1]  # Detect()
+        if isinstance(m, (Detect, IDetect, Segment, ISegment, IRSegment)):
+            m.stride = fn(m.stride)
+            m.grid = list(map(fn, m.grid))
+            if isinstance(m.anchor_grid, list):
+                m.anchor_grid = list(map(fn, m.anchor_grid))
+        return self
+
+
+class DetectionModel(BaseModel):
+    # YOLOv5 detection model
+    def __init__(self, cfg='yolov5s.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+        super().__init__()
+        if isinstance(cfg, dict):
+            self.yaml = cfg  # model dict
+        else:  # is *.yaml
+            import yaml  # for torch hub
+            self.yaml_file = Path(cfg).name
+            with open(cfg, encoding='ascii', errors='ignore') as f:
+                self.yaml = yaml.safe_load(f)  # model dict
+
+        # Define model
+        ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
+        if nc and nc != self.yaml['nc']:
+            LOGGER.info(f"Overriding model.yaml nc={self.yaml['nc']} with nc={nc}")
+            self.yaml['nc'] = nc  # override yaml value
+        if anchors:
+            LOGGER.info(f'Overriding model.yaml anchors with anchors={anchors}')
+            self.yaml['anchors'] = round(anchors)  # override yaml value
+        self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
+        self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
+        self.inplace = self.yaml.get('inplace', True)
+
+        # Build strides, anchors
+        m = self.model[-1]  # Detect()
+        if isinstance(m, (Detect, IDetect, Segment, ISegment, IRSegment)):
+            s = 256  # 2x min stride
+            m.inplace = self.inplace
+            forward = lambda x: self.forward(x)[0] if isinstance(m, (Segment, ISegment, IRSegment)) else self.forward(x)
+            m.stride = torch.tensor([s / x.shape[-2] for x in forward(torch.zeros(1, ch, s, s))])  # forward
+            check_anchor_order(m)
+            m.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            self._initialize_biases()  # only run once
+
+        # Init weights, biases
+        initialize_weights(self)
+        self.info()
+        LOGGER.info('')
+
+    def forward(self, x, augment=False, profile=False, visualize=False):
+        if augment:
+            return self._forward_augment(x)  # augmented inference, None
+        return self._forward_once(x, profile, visualize)  # single-scale inference, train
+
+    def _forward_augment(self, x):
+        img_size = x.shape[-2:]  # height, width
+        s = [1, 0.83, 0.67]  # scales
+        f = [None, 3, None]  # flips (2-ud, 3-lr)
+        y = []  # outputs
+        for si, fi in zip(s, f):
+            xi = scale_img(x.flip(fi) if fi else x, si, gs=int(self.stride.max()))
+            yi = self._forward_once(xi)[0]  # forward
+            # cv2.imwrite(f'img_{si}.jpg', 255 * xi[0].cpu().numpy().transpose((1, 2, 0))[:, :, ::-1])  # save
+            yi = self._descale_pred(yi, fi, si, img_size)
+            y.append(yi)
+        y = self._clip_augmented(y)  # clip augmented tails
+        return torch.cat(y, 1), None  # augmented inference, train
+
+    def _descale_pred(self, p, flips, scale, img_size):
+        # de-scale predictions following augmented inference (inverse operation)
+        if self.inplace:
+            p[..., :4] /= scale  # de-scale
+            if flips == 2:
+                p[..., 1] = img_size[0] - p[..., 1]  # de-flip ud
+            elif flips == 3:
+                p[..., 0] = img_size[1] - p[..., 0]  # de-flip lr
         else:
-            device = model.device
-            if not (pt or jit):
-                batch_size = 1  # export.py models default to batch-size 1
-                LOGGER.info(f'Forcing --batch-size 1 square inference (1,3,{imgsz},{imgsz}) for non-PyTorch models')
+            x, y, wh = p[..., 0:1] / scale, p[..., 1:2] / scale, p[..., 2:4] / scale  # de-scale
+            if flips == 2:
+                y = img_size[0] - y  # de-flip ud
+            elif flips == 3:
+                x = img_size[1] - x  # de-flip lr
+            p = torch.cat((x, y, wh, p[..., 4:]), -1)
+        return p
 
-        # Data
-        data = check_dataset(data)  # check
+    def _clip_augmented(self, y):
+        # Clip YOLOv5 augmented inference tails
+        nl = self.model[-1].nl  # number of detection layers (P3-P5)
+        g = sum(4 ** x for x in range(nl))  # grid points
+        e = 1  # exclude layer count
+        i = (y[0].shape[1] // g) * sum(4 ** x for x in range(e))  # indices
+        y[0] = y[0][:, :-i]  # large
+        i = (y[-1].shape[1] // g) * sum(4 ** (nl - 1 - x) for x in range(e))  # indices
+        y[-1] = y[-1][:, i:]  # small
+        return y
 
-    # Configure
-    model.eval()
-    cuda = device.type != 'cpu'
-    is_coco = isinstance(data.get('val'), str) and data['val'].endswith(f'coco{os.sep}val2017.txt')  # COCO dataset
-    nc = 1 if single_cls else int(data['nc'])  # number of classes
-    iouv = torch.linspace(0.5, 0.95, 10, device=device)  # iou vector for mAP@0.5:0.95
-    niou = iouv.numel()
-
-    # Dataloader
-    if not training:
-        if pt and not single_cls:  # check --weights are trained on --data
-            ncm = model.model.nc
-            assert ncm == nc, f'{weights} ({ncm} classes) trained on different --data than what you passed ({nc} ' \
-                              f'classes). Pass correct combination of --weights and --data that are trained together.'
-        model.warmup(imgsz=(1 if pt else batch_size, 3, imgsz, imgsz))  # warmup
-        pad = 0.0 if task in ('speed', 'benchmark') else 0.5
-        rect = False if task == 'benchmark' else pt  # square inference for benchmarks
-        task = task if task in ('train', 'val', 'test') else 'val'  # path to train/val/test images
-        dataloader = create_dataloader(data[task],
-                                       imgsz,
-                                       batch_size,
-                                       stride,
-                                       single_cls,
-                                       pad=pad,
-                                       rect=rect,
-                                       workers=workers,
-                                       prefix=colorstr(f'{task}: '),
-                                       overlap_mask=overlap,
-                                       mask_downsample_ratio=mask_downsample_ratio)[0]
-
-    seen = 0
-    confusion_matrix = ConfusionMatrix(nc=nc)
-    names = model.names if hasattr(model, 'names') else model.module.names  # get class names
-    if isinstance(names, (list, tuple)):  # old format
-        names = dict(enumerate(names))
-    class_map = coco80_to_coco91_class() if is_coco else list(range(1000))
-    s = ('%22s' + '%11s' * 10) % ('Class', 'Images', 'Instances', 'Box(P', "R", "mAP50", "mAP50-95)", "Mask(P", "R",
-                                  "mAP50", "mAP50-95)")
-    dt = Profile(), Profile(), Profile()
-    metrics = Metrics()
-    loss = torch.zeros(4, device=device)
-    jdict, stats = [], []
-    # callbacks.run('on_val_start')
-    pbar = tqdm(dataloader, desc=s, bar_format='{l_bar}{bar:10}{r_bar}{bar:-10b}')  # progress bar
-    for batch_i, (im, targets, paths, shapes, masks) in enumerate(pbar):
-        # callbacks.run('on_val_batch_start')
-        with dt[0]:
-            if cuda:
-                im = im.to(device, non_blocking=True)
-                targets = targets.to(device)
-                masks = masks.to(device)
-            masks = masks.float()
-            im = im.half() if half else im.float()  # uint8 to fp16/32
-            im /= 255  # 0 - 255 to 0.0 - 1.0
-            nb, _, height, width = im.shape  # batch size, channels, height, width
-
-        # Inference
-        with dt[1]:
-            out, train_out = model(im)  # if training else model(im, augment=augment, val=True)  # inference, loss
-
-        # Loss
-        if compute_loss:
-            loss += compute_loss(train_out, targets, masks)[1]  # box, obj, cls
-
-        # NMS
-        targets[:, 2:] *= torch.tensor((width, height, width, height), device=device)  # to pixels
-        lb = [targets[targets[:, 0] == i, 1:] for i in range(nb)] if save_hybrid else []  # for autolabelling
-        with dt[2]:
-            out = non_max_suppression(out,
-                                      conf_thres,
-                                      iou_thres,
-                                      labels=lb,
-                                      multi_label=True,
-                                      agnostic=single_cls,
-                                      max_det=max_det,
-                                      nm=nm)
-
-        # Metrics
-        plot_masks = []  # masks for plotting
-        for si, pred in enumerate(out):
-            labels = targets[targets[:, 0] == si, 1:]
-            nl, npr = labels.shape[0], pred.shape[0]  # number of labels, predictions
-            path, shape = Path(paths[si]), shapes[si][0]
-            correct_masks = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            correct_bboxes = torch.zeros(npr, niou, dtype=torch.bool, device=device)  # init
-            seen += 1
-
-            if npr == 0:
-                if nl:
-                    stats.append((correct_masks, correct_bboxes, *torch.zeros((2, 0), device=device), labels[:, 0]))
-                    if plots:
-                        confusion_matrix.process_batch(detections=None, labels=labels[:, 0])
-                continue
-
-            # Masks
-            midx = [si] if overlap else targets[:, 0] == si
-            gt_masks = masks[midx]
-            proto_out = train_out[1][si]
-            pred_masks = process(proto_out, pred[:, 6:], pred[:, :4], shape=im[si].shape[1:])
-
-            # Predictions
-            if single_cls:
-                pred[:, 5] = 0
-            predn = pred.clone()
-            scale_coords(im[si].shape[1:], predn[:, :4], shape, shapes[si][1])  # native-space pred
-
-            # Evaluate
-            if nl:
-                tbox = xywh2xyxy(labels[:, 1:5])  # target boxes
-                scale_coords(im[si].shape[1:], tbox, shape, shapes[si][1])  # native-space labels
-                labelsn = torch.cat((labels[:, 0:1], tbox), 1)  # native-space labels
-                correct_bboxes = process_batch(predn, labelsn, iouv)
-                correct_masks = process_batch(predn, labelsn, iouv, pred_masks, gt_masks, overlap=overlap, masks=True)
-                if plots:
-                    confusion_matrix.process_batch(predn, labelsn)
-            stats.append((correct_masks, correct_bboxes, pred[:, 4], pred[:, 5], labels[:, 0]))  # (conf, pcls, tcls)
-
-            pred_masks = torch.as_tensor(pred_masks, dtype=torch.uint8)
-            if plots and batch_i < 3:
-                plot_masks.append(pred_masks[:15].cpu())  # filter top 15 to plot
-
-            # Save/log
-            if save_txt:
-                save_one_txt(predn, save_conf, shape, file=save_dir / 'labels' / f'{path.stem}.txt')
-            if save_json:
-                pred_masks = scale_masks(im[si].shape[1:],
-                                         pred_masks.permute(1, 2, 0).contiguous().cpu().numpy(), shape, shapes[si][1])
-                save_one_json(predn, jdict, path, class_map, pred_masks)  # append to COCO-JSON dictionary
-            # callbacks.run('on_val_image_end', pred, predn, path, names, im[si])
-
-        # Plot images
-        if plots and batch_i < 3:
-            if len(plot_masks):
-                plot_masks = torch.cat(plot_masks, dim=0)
-            plot_images_and_masks(im, targets, masks, paths, save_dir / f'val_batch{batch_i}_labels.jpg', names)
-            plot_images_and_masks(im, output_to_target(out, max_det=15), plot_masks, paths,
-                                  save_dir / f'val_batch{batch_i}_pred.jpg', names)  # pred
-
-        # callbacks.run('on_val_batch_end')
-
-    # Compute metrics
-    stats = [torch.cat(x, 0).cpu().numpy() for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
-        results = ap_per_class_box_and_mask(*stats, plot=plots, save_dir=save_dir, names=names)
-        metrics.update(results)
-    nt = np.bincount(stats[4].astype(int), minlength=nc)  # number of targets per class
-
-    # Print results
-    pf = '%22s' + '%11i' * 2 + '%11.3g' * 8  # print format
-    LOGGER.info(pf % ("all", seen, nt.sum(), *metrics.mean_results()))
-    if nt.sum() == 0:
-        LOGGER.warning(f'WARNING: no labels found in {task} set, can not compute metrics without labels ⚠️')
-
-    # Print results per class
-    if (verbose or (nc < 50 and not training)) and nc > 1 and len(stats):
-        for i, c in enumerate(metrics.ap_class_index):
-            LOGGER.info(pf % (names[c], seen, nt[c], *metrics.class_result(i)))
-
-    # Print speeds
-    t = tuple(x.t / seen * 1E3 for x in dt)  # speeds per image
-    if not training:
-        shape = (batch_size, 3, imgsz, imgsz)
-        LOGGER.info(f'Speed: %.1fms pre-process, %.1fms inference, %.1fms NMS per image at shape {shape}' % t)
-
-    # Plots
-    if plots:
-        confusion_matrix.plot(save_dir=save_dir, names=list(names.values()))
-    # callbacks.run('on_val_end')
-
-    mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask = metrics.mean_results()
-
-    # Save JSON
-    if save_json and len(jdict):
-        w = Path(weights[0] if isinstance(weights, list) else weights).stem if weights is not None else ''  # weights
-        anno_json = str(Path(data.get('path', '../coco')) / 'annotations/instances_val2017.json')  # annotations json
-        pred_json = str(save_dir / f"{w}_predictions.json")  # predictions json
-        LOGGER.info(f'\nEvaluating pycocotools mAP... saving {pred_json}...')
-        with open(pred_json, 'w') as f:
-            json.dump(jdict, f)
-
-        try:  # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
-            from pycocotools.coco import COCO
-            from pycocotools.cocoeval import COCOeval
-
-            anno = COCO(anno_json)  # init annotations api
-            pred = anno.loadRes(pred_json)  # init predictions api
-            results = []
-            for eval in COCOeval(anno, pred, 'bbox'), COCOeval(anno, pred, 'segm'):
-                if is_coco:
-                    eval.params.imgIds = [int(Path(x).stem) for x in dataloader.dataset.im_files]  # img ID to evaluate
-                eval.evaluate()
-                eval.accumulate()
-                eval.summarize()
-                results.extend(eval.stats[:2])  # update results (mAP@0.5:0.95, mAP@0.5)
-            map_bbox, map50_bbox, map_mask, map50_mask = results
-        except Exception as e:
-            LOGGER.info(f'pycocotools unable to run: {e}')
-
-    # Return results
-    model.float()  # for training
-    if not training:
-        s = f"\n{len(list(save_dir.glob('labels/*.txt')))} labels saved to {save_dir / 'labels'}" if save_txt else ''
-        LOGGER.info(f"Results saved to {colorstr('bold', save_dir)}{s}")
-    final_metric = mp_bbox, mr_bbox, map50_bbox, map_bbox, mp_mask, mr_mask, map50_mask, map_mask
-    return (*final_metric, *(loss.cpu() / len(dataloader)).tolist()), metrics.get_maps(nc), t
+    def _initialize_biases(self, cf=None):  # initialize biases into Detect(), cf is class frequency
+        # https://arxiv.org/abs/1708.02002 section 3.3
+        # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
+        m = self.model[-1]  # Detect() module
+        for mi, s in zip(m.m, m.stride):  # from
+            b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
+            b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
+            b.data[:, 5:5 + m.nc] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
+            mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
 
 
-def parse_opt():
+Model = DetectionModel  # retain YOLOv5 'Model' class for backwards compatibility
+
+
+class SegmentationModel(DetectionModel):
+    # YOLOv5 segmentation model
+    def __init__(self, cfg='yolov5s-seg.yaml', ch=3, nc=None, anchors=None):
+        super().__init__(cfg, ch, nc, anchors)
+
+
+class ClassificationModel(BaseModel):
+    # YOLOv5 classification model
+    def __init__(self, cfg=None, model=None, nc=1000, cutoff=10):  # yaml, model, number of classes, cutoff index
+        super().__init__()
+        self._from_detection_model(model, nc, cutoff) if model is not None else self._from_yaml(cfg)
+
+    def _from_detection_model(self, model, nc=1000, cutoff=10):
+        # Create a YOLOv5 classification model from a YOLOv5 detection model
+        if isinstance(model, DetectMultiBackend):
+            model = model.model  # unwrap DetectMultiBackend
+        model.model = model.model[:cutoff]  # backbone
+        m = model.model[-1]  # last layer
+        ch = m.conv.in_channels if hasattr(m, 'conv') else m.cv1.conv.in_channels  # ch into module
+        c = Classify(ch, nc)  # Classify()
+        c.i, c.f, c.type = m.i, m.f, 'models.common.Classify'  # index, from, type
+        model.model[-1] = c  # replace
+        self.model = model.model
+        self.stride = model.stride
+        self.save = []
+        self.nc = nc
+
+    def _from_yaml(self, cfg):
+        # Create a YOLOv5 classification model from a *.yaml file
+        self.model = None
+
+
+def parse_model(d, ch):  # model_dict, input_channels(3)
+    LOGGER.info(f"\n{'':>3}{'from':>18}{'n':>3}{'params':>10}  {'module':<40}{'arguments':<30}")
+    anchors, nc, gd, gw = d['anchors'], d['nc'], d['depth_multiple'], d['width_multiple']
+    na = (len(anchors[0]) // 2) if isinstance(anchors, list) else anchors  # number of anchors
+    no = na * (nc + 5)  # number of outputs = anchors * (classes + 5)
+
+    layers, save, c2 = [], [], ch[-1]  # layers, savelist, ch out
+    for i, (f, n, m, args) in enumerate(d['backbone'] + d['head']):  # from, number, module, args
+        m = eval(m) if isinstance(m, str) else m  # eval strings
+        for j, a in enumerate(args):
+            with contextlib.suppress(NameError):
+                args[j] = eval(a) if isinstance(a, str) else a  # eval strings
+
+        n = n_ = max(round(n * gd), 1) if n > 1 else n  # depth gain
+        if m in {
+                Conv, GhostConv, Bottleneck, GhostBottleneck, SPP, SPPF, DWConv, MixConv2d, Focus, CrossConv,
+                BottleneckCSP, C3, C3TR, C3SPP, C3Ghost, nn.ConvTranspose2d, DWConvTranspose2d, C3x, SPPCSPC}:
+            c1, c2 = ch[f], args[0]
+            if c2 != no:  # if not output
+                c2 = make_divisible(c2 * gw, 8)
+
+            args = [c1, c2, *args[1:]]
+            if m in {BottleneckCSP, C3, C3TR, C3Ghost, C3x, SPPCSPC}:
+                args.insert(2, n)  # number of repeats
+                n = 1
+        elif m is nn.BatchNorm2d:
+            args = [ch[f]]
+        elif m is Concat:
+            c2 = sum(ch[x] for x in f)
+        # TODO: channel, gw, gd
+        elif m in {Detect, IDetect, Segment, ISegment, IRSegment}:
+            args.append([ch[x] for x in f])
+            if isinstance(args[1], int):  # number of anchors
+                args[1] = [list(range(args[1] * 2))] * len(f)
+            if m in {Segment, ISegment, IRSegment}:
+                args[3] = make_divisible(args[3] * gw, 8)
+        elif m is Contract:
+            c2 = ch[f] * args[0] ** 2
+        elif m is Expand:
+            c2 = ch[f] // args[0] ** 2
+        else:
+            c2 = ch[f]
+
+        m_ = nn.Sequential(*(m(*args) for _ in range(n))) if n > 1 else m(*args)  # module
+        t = str(m)[8:-2].replace('__main__.', '')  # module type
+        np = sum(x.numel() for x in m_.parameters())  # number params
+        m_.i, m_.f, m_.type, m_.np = i, f, t, np  # attach index, 'from' index, type, number params
+        LOGGER.info(f'{i:>3}{str(f):>18}{n_:>3}{np:10.0f}  {t:<40}{str(args):<30}')  # print
+        save.extend(x % i for x in ([f] if isinstance(f, int) else f) if x != -1)  # append to savelist
+        layers.append(m_)
+        if i == 0:
+            ch = []
+        ch.append(c2)
+    return nn.Sequential(*layers), sorted(save)
+
+
+if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument('--data', type=str, default=ROOT / 'data/coco128-seg.yaml', help='dataset.yaml path')
-    parser.add_argument('--weights', nargs='+', type=str, default=ROOT / 'yolov5s-seg.pt', help='model path(s)')
-    parser.add_argument('--batch-size', type=int, default=32, help='batch size')
-    parser.add_argument('--imgsz', '--img', '--img-size', type=int, default=640, help='inference size (pixels)')
-    parser.add_argument('--conf-thres', type=float, default=0.001, help='confidence threshold')
-    parser.add_argument('--iou-thres', type=float, default=0.6, help='NMS IoU threshold')
-    parser.add_argument('--max-det', type=int, default=300, help='maximum detections per image')
-    parser.add_argument('--task', default='val', help='train, val, test, speed or study')
+    parser.add_argument('--cfg', type=str, default='yolov5s.yaml', help='model.yaml')
+    parser.add_argument('--batch-size', type=int, default=1, help='total batch size for all GPUs')
     parser.add_argument('--device', default='', help='cuda device, i.e. 0 or 0,1,2,3 or cpu')
-    parser.add_argument('--workers', type=int, default=8, help='max dataloader workers (per RANK in DDP mode)')
-    parser.add_argument('--single-cls', action='store_true', help='treat as single-class dataset')
-    parser.add_argument('--augment', action='store_true', help='augmented inference')
-    parser.add_argument('--verbose', action='store_true', help='report mAP by class')
-    parser.add_argument('--save-txt', action='store_true', help='save results to *.txt')
-    parser.add_argument('--save-hybrid', action='store_true', help='save label+prediction hybrid results to *.txt')
-    parser.add_argument('--save-conf', action='store_true', help='save confidences in --save-txt labels')
-    parser.add_argument('--save-json', action='store_true', help='save a COCO-JSON results file')
-    parser.add_argument('--project', default=ROOT / 'runs/val-seg', help='save results to project/name')
-    parser.add_argument('--name', default='exp', help='save to project/name')
-    parser.add_argument('--exist-ok', action='store_true', help='existing project/name ok, do not increment')
-    parser.add_argument('--half', action='store_true', help='use FP16 half-precision inference')
-    parser.add_argument('--dnn', action='store_true', help='use OpenCV DNN for ONNX inference')
+    parser.add_argument('--profile', action='store_true', help='profile model speed')
+    parser.add_argument('--line-profile', action='store_true', help='profile model speed layer by layer')
+    parser.add_argument('--test', action='store_true', help='test all yolo*.yaml')
     opt = parser.parse_args()
-    opt.data = check_yaml(opt.data)  # check YAML
-    # opt.save_json |= opt.data.endswith('coco.yaml')
-    opt.save_txt |= opt.save_hybrid
+    opt.cfg = check_yaml(opt.cfg)  # check YAML
     print_args(vars(opt))
-    return opt
+    device = select_device(opt.device)
 
+    # Create model
+    im = torch.rand(opt.batch_size, 3, 640, 640).to(device)
+    model = Model(opt.cfg).to(device)
 
-def main(opt):
-    #check_requirements(requirements=ROOT / 'requirements.txt', exclude=('tensorboard', 'thop'))
+    # Options
+    if opt.line_profile:  # profile layer by layer
+        model(im, profile=True)
 
-    if opt.task in ('train', 'val', 'test'):  # run normally
-        if opt.conf_thres > 0.001:  # https://github.com/ultralytics/yolov5/issues/1466
-            LOGGER.info(f'WARNING: confidence threshold {opt.conf_thres} > 0.001 produces invalid results ⚠️')
-        if opt.save_hybrid:
-            LOGGER.info('WARNING: --save-hybrid will return high mAP from hybrid labels, not from predictions alone ⚠️')
-        run(**vars(opt))
+    elif opt.profile:  # profile forward-backward
+        results = profile(input=im, ops=[model], n=3)
 
-    else:
-        weights = opt.weights if isinstance(opt.weights, list) else [opt.weights]
-        opt.half = True  # FP16 for fastest results
-        if opt.task == 'speed':  # speed benchmarks
-            # python val.py --task speed --data coco.yaml --batch 1 --weights yolov5n.pt yolov5s.pt...
-            opt.conf_thres, opt.iou_thres, opt.save_json = 0.25, 0.45, False
-            for opt.weights in weights:
-                run(**vars(opt), plots=False)
+    elif opt.test:  # test all models
+        for cfg in Path(ROOT / 'models').rglob('yolo*.yaml'):
+            try:
+                _ = Model(cfg)
+            except Exception as e:
+                print(f'Error in {cfg}: {e}')
 
-        elif opt.task == 'study':  # speed vs mAP benchmarks
-            # python val.py --task study --data coco.yaml --iou 0.7 --weights yolov5n.pt yolov5s.pt...
-            for opt.weights in weights:
-                f = f'study_{Path(opt.data).stem}_{Path(opt.weights).stem}.txt'  # filename to save to
-                x, y = list(range(256, 1536 + 128, 128)), []  # x axis (image sizes), y axis
-                for opt.imgsz in x:  # img-size
-                    LOGGER.info(f'\nRunning {f} --imgsz {opt.imgsz}...')
-                    r, _, t = run(**vars(opt), plots=False)
-                    y.append(r + t)  # results and times
-                np.savetxt(f, y, fmt='%10.4g')  # save
-            os.system('zip -r study.zip study_*.txt')
-            plot_val_study(x=x)  # plot
-
-
-if __name__ == "__main__":
-    opt = parse_opt()
-    main(opt)
+    else:  # report fused model summary
+        model.fuse()
